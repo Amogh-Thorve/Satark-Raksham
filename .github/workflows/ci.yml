@@ -91,7 +91,7 @@ jobs:
       - name: Publish the report
         if: always()
         run: cat ops/eval/reports/eval_report.md >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: eval-report
