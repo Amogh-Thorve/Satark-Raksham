@@ -1,0 +1,891 @@
+openapi: 3.0.3
+info:
+  title: Satark Backend API
+  version: 0.1.0
+  description: >
+    Backend contract for Satark (Member 3). Owned by Member 3; every change
+    needs approval from Member 1 and Member 4 as consumers.
+
+servers:
+  - url: /
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+
+    AuthChallengeRequest:
+      type: object
+      properties: {}
+
+    AuthChallengeResponse:
+      type: object
+      required: [challenge, expires_at]
+      properties:
+        challenge:
+          type: string
+          description: Base64url-encoded random nonce, one-time use.
+        expires_at:
+          type: string
+          format: date-time
+
+    AuthDeviceRequest:
+      type: object
+      required: [challenge, public_key, attestation_chain]
+      properties:
+        challenge:
+          type: string
+        public_key:
+          type: string
+          description: Base64-encoded DER public key.
+        attestation_chain:
+          type: array
+          items:
+            type: string
+          description: Base64-encoded DER certificates, leaf first.
+        role:
+          type: string
+          enum: [device]
+          default: device
+
+    AuthTokenResponse:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_in, device_id]
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        token_type:
+          type: string
+          enum: [bearer]
+        expires_in:
+          type: integer
+        device_id:
+          type: string
+          format: uuid
+
+    AuthRefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+
+    TrustedContactRequest:
+      type: object
+      required: [trusted_device_id, fcm_token]
+      properties:
+        trusted_device_id:
+          type: string
+          format: uuid
+        fcm_token:
+          type: string
+
+    TrustedContactResponse:
+      type: object
+      required: [linked, status]
+      properties:
+        linked:
+          type: boolean
+          description: True only when the contact has accepted.
+        status:
+          type: string
+          enum: [pending, accepted, revoked]
+
+    TrustedContactsResponse:
+      type: object
+      required: [contacts]
+      properties:
+        contacts:
+          type: array
+          items:
+            type: object
+            required: [trusted_device_id]
+            properties:
+              trusted_device_id:
+                type: string
+              name:
+                type: string
+                description: The name the contact signed in with. Absent when they did not give one.
+
+    TrustedByPhoneRequest:
+      type: object
+      additionalProperties: false
+      required: [phone]
+      properties:
+        phone:
+          type: string
+          pattern: '^\+[1-9]\d{7,14}$'
+          description: The contact's number in E.164. It is hashed and forgotten; it is never stored.
+
+    TrustedByPhoneResponse:
+      type: object
+      required: [requested]
+      properties:
+        requested:
+          type: boolean
+          description: Always true for a well-formed request, whether or not that number has Satark.
+
+    PushTokenRequest:
+      type: object
+      additionalProperties: false
+      required: [fcm_token]
+      properties:
+        fcm_token:
+          type: string
+          minLength: 1
+          maxLength: 4096
+
+    TrustedRequestsResponse:
+      type: object
+      required: [requests]
+      properties:
+        requests:
+          type: array
+          items:
+            type: object
+            required: [owner_device_id]
+            properties:
+              owner_device_id:
+                type: string
+              owner_name:
+                type: string
+                description: The name the asking person signed in with. Absent when they did not give one.
+
+    TrustedRespondRequest:
+      type: object
+      required: [owner_device_id, decision]
+      properties:
+        owner_device_id:
+          type: string
+          maxLength: 36
+        decision:
+          type: string
+          enum: [accept, decline]
+
+    Decision:
+      type: object
+      required: [level, score, reasons]
+      properties:
+        level:
+          type: string
+          enum: [NONE, LOG, NUDGE, HARD, TRUSTED_CONTACT]  # LOG: silent, recorded only (shadow mode); never holds
+        score:
+          type: number
+          format: float
+        reasons:
+          type: array
+          items:
+            type: string
+          maxItems: 3
+
+    RiskCheckRequest:
+      type: object
+      required: [decision, method, amount, payee_hash]
+      properties:
+        decision:
+          $ref: '#/components/schemas/Decision'
+        method:
+          type: string
+          enum: [upi_intent, checkout]
+        amount:
+          type: number
+          format: float
+          minimum: 0
+          exclusiveMinimum: true
+          maximum: 10000000
+          description: Rupees. Must be finite, positive and at most 10,000,000 (a sanity bound).
+        payee_hash:
+          type: string
+          minLength: 1
+          maxLength: 128
+        is_p2p:
+          type: boolean
+        override:
+          type: boolean
+          default: false
+          description: >
+            "Continue anyway". With payment_id of the caller's own held payment, moves it held -> allowed_by_user and
+            returns ALLOW. Only a detector hold can be overridden (409 override_not_allowed otherwise). amount must fall in the
+            held payment's band (409 amount_mismatch). Also used by the owner to get the order after a trusted contact
+            approved a checkout payment.
+        payment_id:
+          type: string
+          maxLength: 36
+          description: Required when override is true.
+
+    RiskCheckResponse:
+      type: object
+      required: [decision, payment_id]
+      properties:
+        decision:
+          type: string
+          enum: [HOLD, ALLOW]
+        payment_id:
+          type: string
+          format: uuid
+        order_id:
+          type: string
+          description: Present only when method is checkout and decision is ALLOW.
+        hold_reason:
+          type: string
+          enum: [detector, payee_fan_in]
+          description: Present only when decision is HOLD. payee_fan_in means many other devices paid this payee recently.
+
+    PaymentResponse:
+      type: object
+      required: [id, method, state, amount_band, payee_hash]
+      properties:
+        id:
+          type: string
+          format: uuid
+        method:
+          type: string
+          enum: [upi_intent, checkout]
+        state:
+          type: string
+          enum:
+            - created
+            - held
+            - approved
+            - blocked
+            - allowed_by_user
+            - allowed
+            - paid
+            - failed
+            - handed_off
+            - reported_success
+            - reported_failure
+            - no_result
+        amount_band:
+          type: string
+          enum: [lt_500, 500_2k, 2k_10k, 10k_50k, 50k_2l, gt_2l]
+          description: Coarse band of the amount in rupees. The exact amount is never stored with the payment.
+        payee_hash:
+          type: string
+        razorpay_order_id:
+          type: string
+        hold_reason:
+          type: string
+        user_override:
+          type: boolean
+          description: Present (true) when the owner released a detector hold with "Continue anyway".
+        reported_status:
+          type: string
+        reported_txn_ref:
+          type: string
+
+    PaymentResultRequest:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [success, failure]
+        txn_ref:
+          type: string
+          maxLength: 128
+
+    PaymentDecisionRequest:
+      type: object
+      required: [decision]
+      properties:
+        decision:
+          type: string
+          enum: [approve, block]
+
+    AlertRequest:
+      type: object
+      required: [device_id, type]
+      properties:
+        device_id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [alarm, long_session, protection_off_requested, protection_off, removal_guard_off]
+        reasons:
+          type: array
+          items:
+            type: string
+        payment_id:
+          type: string
+          description: Held payment the trusted contact may approve or block.
+
+    AccountRequest:
+      type: object
+      required: [id_token]
+      properties:
+        id_token:
+          type: string
+          maxLength: 8192
+        name:
+          type: string
+          maxLength: 60
+
+    AccountNameRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 60
+
+    AccountResponse:
+      type: object
+      properties:
+        name:
+          type: string
+          nullable: true
+        created:
+          type: boolean
+
+    AlertResponse:
+      type: object
+      required: [accepted]
+      properties:
+        accepted:
+          type: boolean
+
+    SignatureRequest:
+      type: object
+      required: [pattern_id, features]
+      properties:
+        pattern_id:
+          type: string
+        features:
+          type: object
+          additionalProperties:
+            type: number
+
+    SignatureResponse:
+      type: object
+      required: [accepted]
+      properties:
+        accepted:
+          type: boolean
+
+paths:
+  /health:
+    get:
+      summary: Liveness check
+      operationId: getHealth
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /auth/challenge:
+    post:
+      summary: Issue a one-time auth challenge
+      operationId: postAuthChallenge
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthChallengeRequest'
+      responses:
+        '200':
+          description: Challenge issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthChallengeResponse'
+
+  /auth/device:
+    post:
+      summary: Register a device via Android Key Attestation
+      operationId: postAuthDevice
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthDeviceRequest'
+      responses:
+        '200':
+          description: Device registered, tokens issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthTokenResponse'
+        '400':
+          description: Attestation invalid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/refresh:
+    post:
+      summary: Refresh an access token
+      operationId: postAuthRefresh
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthRefreshRequest'
+      responses:
+        '200':
+          description: New tokens issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthTokenResponse'
+        '401':
+          description: Refresh token invalid or expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /trusted-contact:
+    get:
+      summary: The people who accepted being this device's trusted contact
+      description: Accepted contacts only; a pending request is not shown, so this cannot reveal whether a phone number has Satark.
+      operationId: getTrustedContacts
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Accepted contacts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrustedContactsResponse'
+    post:
+      summary: Link a trusted contact's device
+      operationId: postTrustedContact
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrustedContactRequest'
+      responses:
+        '200':
+          description: Linked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrustedContactResponse'
+
+  /trusted-contact/by-phone:
+    post:
+      summary: Ask the person with this phone number to be a trusted contact
+      description: >
+        The server hashes the number, finds the account, and asks that person's newest phone that has registered a push address
+        (PUT /device/push-token). The reply is the same whether or not the number has Satark, so this cannot be used to find out who
+        does. Limited to 10 tries per hour per phone.
+      operationId: postTrustedContactByPhone
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrustedByPhoneRequest'
+      responses:
+        '200':
+          description: Requested (or nobody to ask; indistinguishable)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrustedByPhoneResponse'
+        '429':
+          description: Too many tries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /trusted-contact/requests:
+    get:
+      summary: Pending trusted-contact requests addressed to the calling device
+      operationId: getTrustedRequests
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Requests
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrustedRequestsResponse'
+
+  /trusted-contact/respond:
+    post:
+      summary: The asked device accepts or declines being a trusted contact
+      operationId: postTrustedRespond
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrustedRespondRequest'
+      responses:
+        '200':
+          description: Answered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrustedContactResponse'
+        '404':
+          description: No such request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Already answered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /trusted-contact/{trusted_device_id}:
+    delete:
+      summary: The owner removes a trusted contact (the link is revoked)
+      operationId: deleteTrustedContact
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: trusted_device_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrustedContactResponse'
+        '404':
+          description: No such trusted contact
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /risk-check:
+    post:
+      summary: Evaluate a payment decision before money moves
+      operationId: postRiskCheck
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RiskCheckRequest'
+      responses:
+        '200':
+          description: Risk decision
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RiskCheckResponse'
+
+  /payments/{id}:
+    get:
+      summary: Fetch a payment's current state
+      operationId: getPayment
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Payment state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResponse'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /payments/{id}/result:
+    post:
+      summary: Report the app-observed result of a UPI hand-off
+      operationId: postPaymentResult
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentResultRequest'
+      responses:
+        '200':
+          description: Result recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResponse'
+        '409':
+          description: Invalid transition (e.g. payment is held)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /payments/{id}/decision:
+    post:
+      summary: Trusted contact approves or blocks a held payment (dual custody)
+      operationId: postPaymentDecision
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentDecisionRequest'
+      responses:
+        '200':
+          description: Decision recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResponse'
+        '404':
+          description: Not found, or the caller is not a trusted contact of the payment's owner
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Payment is not held
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /device:
+    delete:
+      summary: Delete everything the server holds for the calling device ("Delete my data")
+      operationId: deleteDevice
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Payments, alerts, trusted links, refresh tokens and the device record were deleted.
+
+  /device/push-token:
+    put:
+      summary: This phone registers where its own notifications go
+      operationId: putPushToken
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PushTokenRequest'
+      responses:
+        '204':
+          description: Saved
+
+  /account:
+    post:
+      summary: Sign in or sign up this phone with a verified phone number
+      description: >
+        The id_token proves a phone number (Firebase Phone Auth in production; "dev:+91..." only on a dev server). The account is found
+        or created by a keyed hash of the number, which is never stored. A second phone with the same number joins the same account.
+      operationId: postAccount
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountRequest'
+      responses:
+        '200':
+          description: Signed in
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountResponse'
+        '401':
+          description: The sign-in could not be verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Phone sign-in is not set up on this server
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    get:
+      summary: The account this phone belongs to
+      operationId: getAccount
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The account
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountResponse'
+        '404':
+          description: This phone has no account
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      summary: Sign out this phone (it stops belonging to the account)
+      operationId: deleteAccountLink
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Signed out (also when there was no account)
+    patch:
+      summary: Change the name shown to trusted contacts
+      operationId: patchAccount
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountNameRequest'
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountResponse'
+        '404':
+          description: This phone has no account
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /webhooks/razorpay:
+    post:
+      summary: Razorpay webhook receiver
+      operationId: postRazorpayWebhook
+      responses:
+        '200':
+          description: Processed (or already processed)
+        '400':
+          description: Forged or malformed signature
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /alert:
+    post:
+      summary: Trigger a trusted-contact push notification
+      operationId: postAlert
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AlertRequest'
+      responses:
+        '200':
+          description: Alert accepted (always 2xx, even on a stale token)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertResponse'
+
+  /signature:
+    post:
+      summary: Ingest a pattern signature
+      operationId: postSignature
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignatureRequest'
+      responses:
+        '200':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignatureResponse'
+        '422':
+          description: Malformed or rejected body (validation_error; the app-wide handler answers 422 for every endpoint)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
