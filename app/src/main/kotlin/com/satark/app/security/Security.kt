@@ -26,7 +26,18 @@ class TokenStore(ctx: Context) {
     var accessToken: String? get() = prefs.getString("access", null); set(v) = prefs.edit().putString("access", v).apply()
     var refreshToken: String? get() = prefs.getString("refresh", null); set(v) = prefs.edit().putString("refresh", v).apply()
     var deviceId: String? get() = prefs.getString("device_id", null); set(v) = prefs.edit().putString("device_id", v).apply()
-    var ageBand: String? get() = prefs.getString("age_band", null); set(v) = prefs.edit().putString("age_band", v).apply()
+    /** Age in years, typed by the person (optional). Stays on this phone: it is never sent, and "Delete my data" erases it. */
+    var ageYears: Int?
+        get() = prefs.getInt("age_years", 0).takeIf { it > 0 }
+        set(v) = prefs.edit().apply { if (v == null) remove("age_years") else putInt("age_years", v) }.apply()
+    /** The name a trusted contact sees, and the phone number as shown to the person (masked). Never the number itself. */
+    var accountName: String? get() = prefs.getString("account_name", null); set(v) = prefs.edit().apply { if (v == null) remove("account_name") else putString("account_name", v) }.apply()
+    var phoneMasked: String? get() = prefs.getString("phone_masked", null); set(v) = prefs.edit().apply { if (v == null) remove("phone_masked") else putString("phone_masked", v) }.apply()
+    val signedIn: Boolean get() = phoneMasked != null
+    /** "Continue without an account": the sign-in screen is not shown again on its own. */
+    var signInSkipped: Boolean get() = prefs.getBoolean("sign_in_skipped", false); set(v) = prefs.edit().putBoolean("sign_in_skipped", v).apply()
+    /** The number last asked to be a trusted contact, masked, while no answer has come. Local only: the server will not say whether a number has Satark. */
+    var waitingContactMasked: String? get() = prefs.getString("waiting_contact", null); set(v) = prefs.edit().apply { if (v == null) remove("waiting_contact") else putString("waiting_contact", v) }.apply()
     var onboarded: Boolean get() = prefs.getBoolean("onboarded", false); set(v) = prefs.edit().putBoolean("onboarded", v).apply()
     /** Consent to watch for scam signals on this phone. Not asked yet = no protection runs. Revocable in Protection settings. */
     val consentAsked: Boolean get() = prefs.contains("consent")
@@ -44,6 +55,9 @@ class TokenStore(ctx: Context) {
     /** Payment pause after a scam warning (ui/alerts/Friction.kt): when it ends, and whether the phrase is still owed. */
     var pauseUntilMs: Long get() = prefs.getLong("pause_until", 0L); set(v) = prefs.edit().putLong("pause_until", v).apply()
     var pausePhraseOwed: Boolean get() = prefs.getBoolean("pause_phrase", false); set(v) = prefs.edit().putBoolean("pause_phrase", v).apply()
+    /** Turning protection off waits (protection/ProtectionOff): when the wait ends on the wall clock (0 = nothing pending), and the uptime clock when it began. */
+    var protectionOffDueMs: Long get() = prefs.getLong("off_due", 0L); set(v) = prefs.edit().putLong("off_due", v).apply()
+    var protectionOffStartedUptimeMs: Long get() = prefs.getLong("off_started", 0L); set(v) = prefs.edit().putLong("off_started", v).apply()
 
     /** Per-install random salt for payee hashes (contracts/upi.md). Generated once. */
     val payeeSalt: ByteArray
