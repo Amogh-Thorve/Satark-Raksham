@@ -47,7 +47,7 @@ class MainActivity : FragmentActivity(), PaymentResultListener { // FragmentActi
     private val graph get() = (application as SatarkApp).graph
     private var pending: PendingPay? = null
     private var status by mutableStateOf<String?>(null)
-    /** The "Protection and trusted contact" screen (also opened by the "pairing code changed" notification). */
+    /** The "Protection and trusted contact" screen (also opened by the link-request notification). */
     private var showProtection by mutableStateOf(false)
     private var consentAsked by mutableStateOf(false)
     private var decidePaymentId by mutableStateOf<String?>(null) // trusted contact opened a held-payment alert
@@ -75,6 +75,8 @@ class MainActivity : FragmentActivity(), PaymentResultListener { // FragmentActi
         super.onStart()
         graph.appVisible = true
         lifecycleScope.launch(Dispatchers.IO) { runCatching { graph.protectionOff.completeIfDue() } } // a finished wait takes effect now
+        // The download guard starts watching once file access is granted, which happens in Settings: restart it when the person comes back.
+        lifecycleScope.launch(Dispatchers.IO) { runCatching { graph.downloadGuard.refresh(); graph.downloadGuard.sweep() } }
         graph.hub.screenRecording.register(getSystemService(android.view.WindowManager::class.java), mainExecutor)
     }
 
