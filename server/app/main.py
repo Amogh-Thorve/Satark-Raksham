@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 
+from app.alerts.fcm_client import check_credentials_json
 from app.auth.config import validate_auth_settings
 from app.auth.errors import AuthError, auth_error_handler
 from app.auth.routes import router as auth_router
@@ -13,7 +14,7 @@ from app.core.settings import get_settings
 from app.db.session import SessionLocal
 from app.payments.jobs import TimeoutSweeper
 from app.payments.service import DEFAULT_HANDED_OFF_TIMEOUT_SECONDS
-from app.routers import alerts, health, payments, risk, signatures, trusted_contact, webhooks, device, admin
+from app.routers import accounts, alerts, health, payments, risk, signatures, trusted_contact, webhooks, device, admin
 
 
 @asynccontextmanager
@@ -25,9 +26,18 @@ async def lifespan(_app: FastAPI):
     sweeper.stop()
 
 
+def validate_push_settings(settings) -> None:
+    """Refuse to boot with Firebase credentials that cannot work: silently falling back to the stub would make alerts look sent and never arrive."""
+    try:
+        check_credentials_json(settings.firebase_credentials_json)
+    except RuntimeError as exc:
+        raise RuntimeError(f"SATARK_FIREBASE_CREDENTIALS_JSON: {exc}") from None
+
+
 def create_app() -> FastAPI:
     configure_logging()
     validate_auth_settings(get_settings())    # refuse to boot with an unsafe auth config
+    validate_push_settings(get_settings())    # ... or with push credentials that cannot work
 
     settings = get_settings()
     # Interactive docs and the schema are for dev only; the contract lives in contracts/api.yaml.
@@ -51,6 +61,7 @@ def create_app() -> FastAPI:
     app.include_router(alerts.router)
     app.include_router(signatures.router)
     app.include_router(device.router)
+    app.include_router(accounts.router)
     app.include_router(admin.router)
 
     return app
