@@ -17,6 +17,9 @@ import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 import com.satark.app.SatarkApp
 import com.satark.app.ui.MainActivity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import java.security.MessageDigest
@@ -58,6 +61,7 @@ object ContactAlertNotifier {
     private const val ID_LONG_SESSION = 4
     private const val ID_CODE_CHANGED = 5
     private const val ID_LINK_REQUEST = 6
+    private const val ID_PROTECTION = 7
 
     fun ensureChannel(ctx: Context) {
         runCatching {
@@ -69,7 +73,7 @@ object ContactAlertNotifier {
     }
 
     fun show(ctx: Context, alert: ContactAlert) =
-        post(ctx, if (alert.isLinkRequest) ID_LINK_REQUEST else if (alert.isLongSession) ID_LONG_SESSION else ID_ALARM, alert.title(), alert.text(), openProtection = alert.isLinkRequest,
+        post(ctx, if (alert.isLinkRequest) ID_LINK_REQUEST else if (alert.isProtectionChange) ID_PROTECTION else if (alert.isLongSession) ID_LONG_SESSION else ID_ALARM, alert.title(), alert.text(), openProtection = alert.isLinkRequest,
             decidePaymentId = alert.paymentId.takeIf { alert.canDecide })
 
     fun showCodeChanged(ctx: Context) = post(
@@ -119,8 +123,9 @@ class SatarkMessagingService : FirebaseMessagingService() {
      * token means they must link again. Say so, but only if a code was already shown on this phone.
      */
     override fun onNewToken(token: String) {
-        val store = runCatching { (application as SatarkApp).graph.store }.getOrNull() ?: return
-        val shown = store.sharedPushTokenHash ?: return
+        val graph = runCatching { (application as SatarkApp).graph }.getOrNull() ?: return
+        if (graph.store.signedIn) CoroutineScope(Dispatchers.IO).launch { graph.accounts.refreshPush(token) }
+        val shown = graph.store.sharedPushTokenHash ?: return
         if (shown != Push.hash(token)) ContactAlertNotifier.showCodeChanged(this)
     }
 }
