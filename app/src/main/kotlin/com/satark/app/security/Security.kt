@@ -36,8 +36,8 @@ class TokenStore(ctx: Context) {
     val signedIn: Boolean get() = phoneMasked != null
     /** "Continue without an account": the sign-in screen is not shown again on its own. */
     var signInSkipped: Boolean get() = prefs.getBoolean("sign_in_skipped", false); set(v) = prefs.edit().putBoolean("sign_in_skipped", v).apply()
-    /** The number last asked to be a trusted contact, masked, while no answer has come. Local only: the server will not say whether a number has Satark. */
-    var waitingContactMasked: String? get() = prefs.getString("waiting_contact", null); set(v) = prefs.edit().apply { if (v == null) remove("waiting_contact") else putString("waiting_contact", v) }.apply()
+    /** An invite code was used and the contact has not answered yet. Local only: the server lists a contact only once they have accepted. */
+    var waitingForContact: Boolean get() = prefs.getBoolean("waiting_contact_request", false); set(v) = prefs.edit().putBoolean("waiting_contact_request", v).apply()
     var onboarded: Boolean get() = prefs.getBoolean("onboarded", false); set(v) = prefs.edit().putBoolean("onboarded", v).apply()
     /** Consent to watch for scam signals on this phone. Not asked yet = no protection runs. Revocable in Protection settings. */
     val consentAsked: Boolean get() = prefs.contains("consent")
@@ -48,6 +48,15 @@ class TokenStore(ctx: Context) {
     var linkedContactId: String? get() = prefs.getString("linked_contact", null); set(v) = prefs.edit().putString("linked_contact", v).apply()
     /** Shadow mode: the detector still scores and the app logs it, but nothing is shown, paused, pushed or held. */
     var shadowMode: Boolean get() = prefs.getBoolean("shadow", false); set(v) = prefs.edit().putBoolean("shadow", v).apply()
+    /** Download guard: opt-in, and what it did (names of files it held or warned about, kept on this phone only). */
+    var downloadGuardOn: Boolean get() = prefs.getBoolean("download_guard", false); set(v) = prefs.edit().putBoolean("download_guard", v).apply()
+    var guardRecordsJson: String get() = prefs.getString("guard_records", "[]")!!; set(v) = prefs.edit().putString("guard_records", v).apply()
+    var guardAllowedJson: String get() = prefs.getString("guard_allowed", "[]")!!; set(v) = prefs.edit().putString("guard_allowed", v).apply()
+    /** The device check remembers a short fingerprint of what it last showed or sent, never the names of apps. */
+    var deviceAckFp: String? get() = prefs.getString("device_ack_fp", null); set(v) = prefs.edit().apply { if (v == null) remove("device_ack_fp") else putString("device_ack_fp", v) }.apply()
+    var deviceAckMs: Long get() = prefs.getLong("device_ack_ms", 0L); set(v) = prefs.edit().putLong("device_ack_ms", v).apply()
+    var deviceNotifiedFp: String? get() = prefs.getString("device_notified_fp", null); set(v) = prefs.edit().apply { if (v == null) remove("device_notified_fp") else putString("device_notified_fp", v) }.apply()
+    var deviceNotifiedMs: Long get() = prefs.getLong("device_notified_ms", 0L); set(v) = prefs.edit().putLong("device_notified_ms", v).apply()
     /** Pointer (content URI) to the phone contact "Call trusted contact" dials. Never the number itself. */
     var dialContactUri: String? get() = prefs.getString("dial_contact", null); set(v) = prefs.edit().putString("dial_contact", v).apply()
     /** SHA-256 of the push token last shown as this phone's pairing code (to notice it changed). Not the token. */
