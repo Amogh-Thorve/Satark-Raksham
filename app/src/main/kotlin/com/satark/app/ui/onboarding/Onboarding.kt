@@ -33,7 +33,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
+import com.satark.app.ui.theme.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -55,15 +55,26 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.text.input.KeyboardType
 import com.satark.app.AppGraph
+import com.satark.app.events.AgeProfile
 import com.satark.app.net.TrustedContactRequest
+import com.satark.app.protection.SatarkAdminReceiver
 import com.satark.app.push.PairingCode
+import com.satark.app.account.PhoneNumber
+import com.satark.app.net.TrustedByPhoneRequest
 import com.satark.app.push.Push
 import com.satark.app.signals.SignalStatus
 import com.satark.app.signals.SourceName
 import com.satark.app.signals.SourceState
+import com.satark.app.ui.lock.FingerprintLock
+import com.satark.app.ui.lock.LockState
+import com.satark.app.ui.lock.rememberLockGate
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -78,11 +89,12 @@ private val steps = listOf(
 
 /** First run, and later the "Protection and trusted contact" screen ([settings] = true) reached from the pay screen. */
 @Composable
-fun OnboardingFlow(graph: AppGraph, settings: Boolean = false, onDeleted: () -> Unit = {}, onDone: () -> Unit) {
+fun OnboardingFlow(graph: AppGraph, settings: Boolean = false, onDeleted: () -> Unit = {}, onSignIn: () -> Unit = {}, onDone: () -> Unit) {
     val ctx = LocalContext.current
     var tick by remember { mutableIntStateOf(0) }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { tick++ }
     val status = remember(tick) { graph.hub.status() }
+    val lock = remember(tick) { FingerprintLock.state(ctx) }
     val scope = rememberCoroutineScope()
 
     val perms = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { tick++ }
@@ -104,6 +116,8 @@ fun OnboardingFlow(graph: AppGraph, settings: Boolean = false, onDeleted: () -> 
             }) else null,
         )
         NeverAsksCard()
+        FingerprintCard(lock)
+        RemovalGuardCard(tick)
         steps.forEach { s ->
             val st = status.of(s.source)
             Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLowest)) {
@@ -119,19 +133,206 @@ fun OnboardingFlow(graph: AppGraph, settings: Boolean = false, onDeleted: () -> 
                 }
             }
         }
+        val overlayOn = remember(tick) { Settings.canDrawOverlays(ctx) }
+        Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLowest)) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Warnings over other apps", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                    Surface(
+                        color = if (overlayOn) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.errorContainer,
+                        shape = MaterialTheme.shapes.small,
+                    ) {
+                        Text(if (overlayOn) "On" else "Off: permission needed", Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (overlayOn) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onErrorContainer)
+                    }
+                }
+                Text("If Satark thinks you are being scammed, it shows a full-screen STOP warning on top of your UPI app. Without this, you only get a notification.",
+                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (!overlayOn) Button(onClick = {
+                    runCatching {
+                        ctx.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, android.net.Uri.parse("package:" + ctx.packageName)))
+                    }
+                }) { Text("Allow") }
+            }
+        }
+        val smsOn = remember(tick) { com.satark.app.signals.SmsReceiver.granted(ctx) }
+        val messagesOn = smsOn
+        Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLowest)) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Messages from strangers", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                    Surface(
+                        color = if (messagesOn) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                        shape = MaterialTheme.shapes.small,
+                    ) {
+                        Text(if (messagesOn) "On" else "Off (optional)", Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (messagesOn) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+                Text("Satark notices when a text comes from a number that is not in your contacts. It sees only who sent it, never what it says.",
+                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (!smsOn) Button(onClick = { perms.launch(arrayOf(Manifest.permission.RECEIVE_SMS)) }) { Text("Allow texts") }
+            }
+        }
+        AgeCard(graph)
         ProtectionBanners(status)
 
         if (settings) LanguageCard()
+        if (settings) AccountCard(graph, onSignIn)
         if (settings) ConsentCard(graph, onDeleted)
 
         TrustedContactSetup(graph)
 
-        Button(onClick = onDone, modifier = Modifier.fillMaxWidth().height(52.dp)) {
+        // The owner check is needed to use Satark: first run cannot finish without a fingerprint or a screen lock (see FingerprintCard).
+        val canStart = settings || lock.ready
+        Button(onClick = onDone, enabled = canStart, modifier = Modifier.fillMaxWidth().height(52.dp)) {
             Text(when {
                 settings -> "Back to Pay via Satark"
                 status.allAvailable -> "Start protection"
                 else -> "Continue with limited protection"
             }, style = MaterialTheme.typography.titleSmall)
+        }
+        if (!canStart) Text("Set up the lock above to start.", style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+/** Android will not uninstall Satark quietly while it is a device administrator (no powers asked); switching it off tells the trusted contact. */
+@Composable
+private fun RemovalGuardCard(tick: Int) {
+    val ctx = LocalContext.current
+    val on = remember(tick) { SatarkAdminReceiver.isActive(ctx) }
+    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLowest)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Protection against removal", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                Surface(
+                    color = if (on) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                    shape = MaterialTheme.shapes.small,
+                ) {
+                    Text(if (on) "On" else "Off (recommended)", Modifier.padding(horizontal = 10.dp, vertical = 4.dp), style = MaterialTheme.typography.labelMedium,
+                        color = if (on) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            Text(
+                if (on) "While this is on, Android will not let Satark be uninstalled until you switch it off in Settings, under Security, Device admin apps. " +
+                    "Your trusted contact is told the moment you do. Switch it off only if you truly want to remove Satark."
+                else "A scammer may tell you to delete Satark. With this on, Android will not remove it until it is switched off in Settings, " +
+                    "which gives you time to think, and your trusted contact is told. Satark asks for no power over your phone.",
+                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (!on) Button(onClick = { runCatching { ctx.startActivity(SatarkAdminReceiver.activateIntent(ctx)) } }) { Text("Turn on") }
+        }
+    }
+}
+
+/** Who is signed in, and how to sign in or out. Signing in is optional; the card says what it is for. */
+@Composable
+private fun AccountCard(graph: AppGraph, onSignIn: () -> Unit) {
+    var name by remember { mutableStateOf(graph.accounts.name) }
+    var phone by remember { mutableStateOf(graph.accounts.phoneMasked) }
+    val scope = rememberCoroutineScope()
+    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLowest)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Account", style = MaterialTheme.typography.titleMedium)
+            if (phone != null) {
+                Text(listOfNotNull(name ?: "No name set", phone).joinToString("  \u00B7  "), style = MaterialTheme.typography.bodyLarge)
+                Text("Your trusted contact sees this name, never your number. Signing out removes this phone from the account; your payments and settings here stay.",
+                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                OutlinedButton(onClick = { scope.launch { graph.accounts.signOut(); name = null; phone = null } }) { Text("Sign out") }
+            } else {
+                Text("Not signed in. With an account your family can find you as a trusted contact by name, and your settings can follow you to a new phone.",
+                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Button(onClick = onSignIn) { Text("Sign in with my phone number") }
+            }
+        }
+    }
+}
+
+/** The lock, explained where Satark is set up: the owner's fingerprint (or the screen-lock PIN on a phone with none) is needed to use Satark. */
+@Composable
+private fun FingerprintCard(state: LockState) {
+    val ctx = LocalContext.current
+    val gate = rememberLockGate()
+    var worked by remember { mutableStateOf(false) }
+    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLowest)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Fingerprint lock", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                Surface(
+                    color = if (state.ready) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.errorContainer,
+                    shape = MaterialTheme.shapes.small,
+                ) {
+                    Text(when (state) {
+                        LockState.FINGERPRINT -> "On"
+                        LockState.PIN_FINGERPRINT_NOT_SET, LockState.PIN_NO_SENSOR -> "On: screen-lock PIN"
+                        LockState.NO_SCREEN_LOCK -> "Off: set a screen lock"
+                        LockState.UNAVAILABLE -> "Not available"
+                    }, Modifier.padding(horizontal = 10.dp, vertical = 4.dp), style = MaterialTheme.typography.labelMedium,
+                        color = if (state.ready) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onErrorContainer)
+                }
+            }
+            Text("Satark checks that it is you before it turns protection off, changes your trusted contact or your age, deletes your data, " +
+                "or lets you continue past a Stop warning. If a scammer is controlling your screen, they cannot pass the check. " +
+                "Your phone does the check; Satark never sees your fingerprint or PIN.",
+                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (state.usesPin) Text("This phone has no fingerprint set up, so Satark will ask for your screen-lock PIN, pattern or password. " +
+                "A fingerprint is safer: a PIN that you type while someone can see your screen is no longer private.",
+                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            when (state) {
+                LockState.FINGERPRINT, LockState.PIN_FINGERPRINT_NOT_SET, LockState.PIN_NO_SENSOR ->
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (state == LockState.PIN_FINGERPRINT_NOT_SET) Button(onClick = {
+                            runCatching { ctx.startActivity(FingerprintLock.enrolIntent()) }
+                                .onFailure { runCatching { ctx.startActivity(Intent(Settings.ACTION_SECURITY_SETTINGS)) } }
+                        }) { Text("Add a fingerprint") }
+                        OutlinedButton(onClick = { gate.require("Try the lock") { worked = true } }) { Text(if (worked) "It works" else "Try it") }
+                    }
+                LockState.NO_SCREEN_LOCK -> Button(onClick = {
+                    runCatching { ctx.startActivity(FingerprintLock.setScreenLockIntent()) }
+                        .onFailure { runCatching { ctx.startActivity(Intent(Settings.ACTION_SECURITY_SETTINGS)) } }
+                }) { Text("Set a screen lock") }
+                LockState.UNAVAILABLE -> Text("The lock is not available right now. Try again in a moment.",
+                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onErrorContainer)
+            }
+        }
+    }
+}
+
+/** Optional. Under 22, a payment to a new payee is held from a lower amount. The age stays on this phone and is never sent anywhere. */
+@Composable
+private fun AgeCard(graph: AppGraph) {
+    var text by rememberSaveable { mutableStateOf(graph.store.ageYears?.toString() ?: "") }
+    // The age sets how sensitive Satark is, so changing it needs the fingerprint: the field opens only after it.
+    var open by remember { mutableStateOf(false) }
+    val lock = rememberLockGate()
+    val age = AgeProfile.parse(text)
+    // Saved a moment after the last key, so typing "21" does not save "2" on the way; an invalid number leaves the saved age alone.
+    LaunchedEffect(text) {
+        if (!open) return@LaunchedEffect
+        delay(700)
+        val next = if (text.isEmpty()) null else AgeProfile.parse(text) ?: return@LaunchedEffect
+        if (next != graph.store.ageYears) graph.setAge(next)
+    }
+    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLowest)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Your age (optional)", style = MaterialTheme.typography.titleMedium)
+            Text("Satark holds a payment to a new payee sooner for people under ${AgeProfile.YOUNG_BELOW}, who usually pay smaller amounts. " +
+                "Your age stays on this phone and is never sent anywhere.",
+                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            OutlinedTextField(text, { v -> text = v.filter(Char::isDigit).take(3) }, label = { Text("Age in years") }, singleLine = true,
+                enabled = open, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth())
+            if (!open) OutlinedButton(onClick = { lock.require("Change your age") { open = true } }) {
+                Text(if (text.isEmpty()) "Enter my age" else "Change my age")
+            }
+            val limit = fun(a: Int?) = "Rs " + "%,d".format(AgeProfile.highValueThreshold(a).toInt())
+            Text(when {
+                text.isEmpty() -> "Not given. A new payee is held from ${limit(null)} while an unknown caller is in touch."
+                age == null -> "Enter your age in years, from ${AgeProfile.MIN_AGE} to ${AgeProfile.MAX_AGE}."
+                else -> "A new payee is held from ${limit(age)} while an unknown caller is in touch."
+            }, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -164,7 +365,7 @@ private fun NeverAsksCard() {
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text("Satark never asks for your PIN or OTP", style = MaterialTheme.typography.titleSmall,
                     color = MaterialTheme.colorScheme.onPrimaryContainer)
-                Text("Real Satark warnings appear only inside this app. They never come as an SMS or a link, and never ask for your UPI PIN, OTP or bank details.",
+                Text("Real Satark warnings appear only in Satark or as Satark's own STOP screen over your apps. They never come as an SMS or a link, and never ask for your UPI PIN, OTP or bank details.",
                     style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onPrimaryContainer)
             }
         }
@@ -214,11 +415,94 @@ fun TrustedContactSetup(graph: AppGraph) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("Trusted contact", style = MaterialTheme.typography.titleMedium)
             Text("A person who gets an alert on their phone if Satark thinks you may be being scammed. They need Satark too.")
+            ContactsByPhone(graph)
+            HorizontalDivider(Modifier.padding(vertical = 4.dp))
             LinkTrustedContact(graph)
             HorizontalDivider(Modifier.padding(vertical = 4.dp))
             MyPairingCode(graph)
         }
     }
+}
+
+/**
+ * Add a trusted contact by their mobile number, and see who has said yes (by name). The server answers the same whether or not the number
+ * has Satark, so "waiting" is only what this phone remembers asking; a contact appears once they have accepted.
+ */
+@Composable
+private fun ContactsByPhone(graph: AppGraph) {
+    var digits by rememberSaveable { mutableStateOf("") }
+    var msg by rememberSaveable { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    var contacts by remember { mutableStateOf<List<com.satark.app.net.MyContact>>(emptyList()) }
+    var waiting by remember { mutableStateOf(graph.store.waitingContactMasked) }
+    val scope = rememberCoroutineScope()
+    val lock = rememberLockGate()
+    val national = PhoneNumber.normalize(digits)
+
+    suspend fun load() {
+        val list = withContext(Dispatchers.IO) { runCatching { graph.api.myTrustedContacts().contacts }.getOrNull() }
+        if (list != null) {
+            contacts = list
+            if (list.isNotEmpty() && waiting != null) { graph.store.waitingContactMasked = null; waiting = null }
+        }
+    }
+    LaunchedEffect(Unit) { load() }
+
+    Text("Your trusted contact", style = MaterialTheme.typography.titleSmall)
+    contacts.forEach { c ->
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+            Text(c.name ?: "A trusted contact", style = MaterialTheme.typography.bodyLarge)
+            OutlinedButton(enabled = !busy, onClick = { lock.require("Remove your trusted contact") {
+                busy = true
+                scope.launch {
+                    val ok = withContext(Dispatchers.IO) { runCatching { graph.api.removeTrustedContact(c.trustedDeviceId) }.isSuccess }
+                    if (ok) { if (graph.store.linkedContactId == c.trustedDeviceId) graph.store.linkedContactId = null; msg = "Removed. They will not get any more alerts."; load() }
+                    else msg = "Could not remove them. Check your connection and try again."
+                    busy = false
+                }
+            } }) { Text("Remove") }
+        }
+    }
+    if (contacts.isEmpty()) Text(
+        waiting?.let { "Waiting for $it to accept. They need to open Satark and tap Accept." } ?: "Nobody yet.",
+        style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Text("Type their mobile number. If they have Satark and have signed in, they are asked to accept. Satark does not keep the number.")
+    OutlinedTextField(
+        digits, { v -> digits = v.filter { it.isDigit() || it == ' ' }.take(15); msg = null },
+        label = { Text("Their 10-digit number") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+    )
+    OutlinedButton(enabled = national != null && !busy, onClick = {
+        val n = national ?: return@OutlinedButton
+        lock.require("Ask a trusted contact") {
+            busy = true
+            scope.launch {
+                msg = withContext(Dispatchers.IO) {
+                    try {
+                        graph.session.ensureRegistered()
+                        graph.api.trustedContactByPhone(TrustedByPhoneRequest(PhoneNumber.e164(n)))
+                        val masked = PhoneNumber.masked(PhoneNumber.e164(n))
+                        graph.store.waitingContactMasked = masked; waiting = masked; digits = ""
+                        "Request sent. If that number has Satark and is signed in, they will be asked. Ask them to open Satark and tap Accept."
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: retrofit2.HttpException) {
+                        if (e.code() == 429) "Too many tries. Wait a while and try again." else "Could not send the request (error ${e.code()}). Try again later."
+                    } catch (e: Exception) {
+                        "Could not reach Satark. Check your internet connection and try again."
+                    }
+                }
+                busy = false
+                load()
+            }
+        }
+    }) { Text(if (busy) "Sending…" else "Ask them") }
+    msg?.let { Text(it) }
+    if (graph.accounts.signedIn.not()) Text(
+        "Tip: sign in (the Account card) so they see your name on the request and on any alert.",
+        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
 }
 
 /** The protected person pastes the contact's code: POST /trusted-contact {trusted_device_id, fcm_token}. */
@@ -228,13 +512,14 @@ private fun LinkTrustedContact(graph: AppGraph) {
     var msg by rememberSaveable { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    val lock = rememberLockGate()
     var dialChosen by remember { mutableStateOf(graph.store.dialContactUri != null) }
     val pickContact = rememberLauncherForActivityResult(ActivityResultContracts.PickContact()) { uri ->
         if (uri != null) { graph.store.dialContactUri = uri.toString(); dialChosen = true }
     }
     Text("Who to call", style = MaterialTheme.typography.titleSmall)
     Text("Pick the person from your contacts that “Call trusted contact” should dial. Satark keeps only which contact you picked, not their number.")
-    OutlinedButton(onClick = { pickContact.launch(null) }) { Text(if (dialChosen) "Change the person to call" else "Choose the person to call") }
+    OutlinedButton(onClick = { lock.require("Change who to call") { pickContact.launch(null) } }) { Text(if (dialChosen) "Change the person to call" else "Choose the person to call") }
     Text("Get alerts sent to someone you trust", style = MaterialTheme.typography.titleSmall)
     Text("Ask them to open Satark, tap “Show my pairing code” and send you the code. Paste it here.")
     OutlinedTextField(code, { code = it; msg = null }, label = { Text("Their pairing code") }, modifier = Modifier.fillMaxWidth(), maxLines = 3)
@@ -243,7 +528,7 @@ private fun LinkTrustedContact(graph: AppGraph) {
         when {
             p == null -> msg = "That code does not look right. Copy the whole code from their Satark."
             p.deviceId == graph.store.deviceId -> msg = "That is your own code. Paste the code from the other person's phone."
-            else -> {
+            else -> lock.require("Link a trusted contact") {
                 busy = true
                 scope.launch {
                     msg = withContext(Dispatchers.IO) { linkContact(graph, p) }
@@ -255,7 +540,7 @@ private fun LinkTrustedContact(graph: AppGraph) {
     msg?.let { Text(it) }
     var removable by remember { mutableStateOf(graph.store.linkedContactId) }
     removable?.let { id ->
-        OutlinedButton(enabled = !busy, onClick = {
+        OutlinedButton(enabled = !busy, onClick = { lock.require("Remove your trusted contact") {
             busy = true
             scope.launch {
                 msg = withContext(Dispatchers.IO) {
@@ -267,7 +552,7 @@ private fun LinkTrustedContact(graph: AppGraph) {
                 removable = graph.store.linkedContactId
                 busy = false
             }
-        }) { Text("Remove this trusted contact") }
+        } }) { Text("Remove this trusted contact") }
     }
 }
 
