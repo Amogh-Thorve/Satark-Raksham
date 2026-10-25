@@ -95,6 +95,42 @@ The wait runs on two clocks, so moving the phone's date does not skip it. A coac
 witness, not a wall. Not covered: revoking permissions or force-stopping Satark in Settings, and a phone that is offline (the contact's
 alert is queued and goes when it is back online).
 
+## Device check (when you go to pay)
+Tapping *Check and pay* first looks at the apps on the phone. It is a warning beside the detector: it never holds a payment, never reaches the
+detector, and never makes Satark quieter. Satark itself and system apps are left out.
+
+| What is found | Level | What the person sees |
+|---|---|---|
+| A remote-access or screen-share app (AnyDesk, TeamViewer, RustDesk, AirDroid and others), even from Google Play | **Serious** | A notification, a red card on the Pay screen, and a dialog before every payment: *Your phone may be vulnerable* |
+| Root or hooking tools (Magisk, KernelSU, LSPosed, a `su` binary) | **Serious** | Same |
+| A known modified copy of a popular app: messaging clones such as GBWhatsApp, and patched Google apps (the ReVanced and Vanced families, microG stand-ins for Google services) | **Serious** | Same |
+| A well-known payment app (PhonePe, Google Pay, Paytm, BHIM and others) that arrived through a file installer or a browser | **Serious** | Same |
+| Any other app installed from outside an official store (a downloaded file, adb), or with no known installer (including a payment app with none, which also happens after a backup restore) | Weak | A notification and an amber card; the dialog asks once, then stays quiet for a week for the same set of apps |
+| Apps from Google Play or a phone maker's store (Samsung, Xiaomi, Huawei, vivo, OPPO and realme, Amazon), a phone maker's preload tool, and the maker's own parts that list no installer | None | Nothing |
+
+The notification is sent at most once a day for the same set of apps. Each finding on the card has a *Remove* button. The check keeps only a short
+fingerprint of what it showed, never app names. The package lists are a curated starting point (`security/DeviceCheck.kt`), not a complete catalogue.
+If the phone does not let Satark list its apps, the check says nothing instead of warning. It is covered by `DeviceCheckTest`.
+
+## Download guard (scam file names)
+Opt-in (Protection screen, *Download guard*). It needs Android 11 or newer and "All files access", and it reads only file **names**, never what is inside a file.
+It watches the Download folder, Documents, and the document folders of WhatsApp, WhatsApp Business and Telegram, and compares a new file's name with the
+names scam files commonly use (`app/.../guard/ScamFileRules.kt`: traffic fines and RTO challans, bank KYC and rewards, government schemes, Aadhaar and PAN
+updates, electricity and gas bills, tax refunds, wedding invitations, SIM and telecom KYC, parcel, customs and police notices, fake customer support, instant
+loans and trading, prizes and free recharge). Separators, capitals and run-together names do not hide a match ("RTO_Challan", "SBIKYCUpdate").
+
+| The file | What happens |
+|---|---|
+| An **app file** (`.apk`, `.apks`, `.xapk`, `.apkm`) with a matching name | **Moved into a private quarantine** within moments, with a notification: *Scam warning: file blocked* |
+| A download **still in progress** under a matching name (`.crdownload`, `.part`, Android's `.pending-…`) | **Deleted**, so the download cannot finish; *Scam warning: download stopped* |
+| A **document or archive** (`.pdf`, `.docx`, `.xlsx`, `.zip`, and similar) with a matching name | **Warned about, left where it is**; *Scam warning: suspicious file* |
+| Photos, videos, anything with no matching name | Nothing |
+
+A held file can be **restored** (behind the fingerprint or PIN, because "put it back" is what a scammer would ask for) or deleted for good. Documents are not moved
+because a genuine electricity bill, tax notice or wedding invitation can have the same name; `ScamFileRules.QUARANTINE_DOCUMENTS` switches that on. These are
+name heuristics, not proof: a real app can have a name like these, and a scam can have an unrelated one. Android does not let an app cancel another app's download,
+so Satark acts on the file as it appears, which is within moments but not before the first byte.
+
 ## Gaps this exposed (said openly)
 - A payment more than **30 minutes after** the unknown call ended is quiet. Text messages never count as unknown contact.
 - The same amount to the same payee again **within 2 minutes** is counted as a retry of one payment, not a second piece.
