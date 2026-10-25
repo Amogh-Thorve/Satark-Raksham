@@ -2,6 +2,7 @@ import logging
 
 from sqlalchemy.orm import Session
 
+from app.accounts.identity import display_name
 from app.alerts.fcm_client import FcmClient, FcmTokenInvalid
 from app.db.models import Alert, Device, TrustedLink
 
@@ -10,10 +11,26 @@ logger = logging.getLogger("satark.alerts.service")
 ALERT_TITLES = {
     "alarm": "Satark alert",
     "long_session": "Satark alert",
+    "protection_off_requested": "Satark alert",
+    "protection_off": "Satark alert",
+    "removal_guard_off": "Satark alert",
 }
 
 # ONE short line for every alert: no reasons, amounts, payees or names reach the contact's lock screen.
 ALERT_BODY = "Someone you protect may be in danger. Please call them."
+# Someone switching Satark off, or making it removable, is what a scammer on the phone asks for: say that, in one line.
+ALERT_BODIES = {
+    "protection_off_requested": "Someone you protect has asked to turn off their Satark protection. Please call them.",
+    "protection_off": "Someone you protect has turned off their Satark protection. Please call them.",
+    "removal_guard_off": "Satark on a phone you protect can now be removed. Please call them.",
+}
+# The same lines with the person's name, for someone who signed in. Still one line, and still nothing about amounts or payees.
+NAMED_ALERT_BODY = "{name} may be in danger. Please call them."
+NAMED_ALERT_BODIES = {
+    "protection_off_requested": "{name} has asked to turn off their Satark protection. Please call them.",
+    "protection_off": "{name} has turned off their Satark protection. Please call them.",
+    "removal_guard_off": "Satark on {name}'s phone can now be removed. Please call them.",
+}
 
 
 def send_alert(
@@ -54,7 +71,11 @@ def send_alert(
         return alert
 
     title = ALERT_TITLES.get(alert_type, "Satark alert")
-    body = ALERT_BODY
+    name = display_name(db, owner_device_id)
+    if name:
+        body = NAMED_ALERT_BODIES.get(alert_type, NAMED_ALERT_BODY).format(name=name)
+    else:
+        body = ALERT_BODIES.get(alert_type, ALERT_BODY)
 
     try:
         fcm_client.send(
@@ -64,6 +85,7 @@ def send_alert(
             data={
                 "type": alert_type,
                 "owner_device_id": owner_device_id,
+                **({"owner_name": name} if name else {}),
                 **({"payment_id": payment_id} if payment_id else {}),
             },
         )
