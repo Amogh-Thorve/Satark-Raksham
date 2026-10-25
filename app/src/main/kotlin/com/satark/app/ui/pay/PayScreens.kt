@@ -23,9 +23,11 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
+import com.satark.app.ui.theme.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
@@ -83,6 +85,9 @@ import kotlinx.coroutines.withContext
 import java.math.BigDecimal
 import java.util.concurrent.Executors
 
+/** A payment that is allowed but earns a nudge, waiting for the person to read it and choose. */
+private class PendingNudge(val n: PayOutcome.Nudged, val req: UpiRequest, val amt: BigDecimal)
+
 /**
  * Home: Pay via Satark. Satark can hold only payments started here; payments started directly in GPay or PhonePe can
  * only be warned about, and a UPI hand-off result is reported by the UPI app, not verified.
@@ -94,6 +99,7 @@ fun PayHome(
     onOutcome: (PayOutcome, UpiRequest, BigDecimal) -> Unit,
     onOpenProtection: () -> Unit = {},
     onNewPayment: () -> Unit = {},
+    onOpenHistory: () -> Unit = {},
 ) {
     // rememberSaveable: typed values survive the activity being recreated (rotation, call screen, process trim).
     var scanning by rememberSaveable { mutableStateOf(false) }
@@ -109,6 +115,7 @@ fun PayHome(
     var heldAmountInr by remember { mutableStateOf<Double?>(null) } // only to pick the coarse amount band for the fraud summary
     var holdStatus by remember { mutableStateOf<String?>(null) } // what the trusted contact has done about a hold
     var busy by remember { mutableStateOf(false) }
+    var nudge by remember { mutableStateOf<PendingNudge?>(null) }
     val scope = rememberCoroutineScope()
     val pause by graph.pause.state.collectAsState()
     var resumed by remember { mutableIntStateOf(0) }
@@ -129,18 +136,58 @@ fun PayHome(
         return
     }
 
+    // What to do with a payment's outcome. A nudge waits here for the person; everything else goes on as before.
+    val handle: suspend (PayOutcome, UpiRequest, BigDecimal) -> Unit = { o, req, amt ->
+                        when (o) {
+                            is PayOutcome.Held -> {
+                                held = ArrayList(o.reasons) // saveable type
+                                heldAmountInr = amt.toDouble()
+                                holdStatus = null
+                                o.paymentId?.let { id ->
+                                    // The trusted contact can approve or block this payment; the person can also choose "Continue anyway".
+                                    holdStatus = "Asking your trusted contact to approve or block this payment…"
+                                    scope.launch {
+                                        withContext(Dispatchers.IO) { runCatching { graph.alerts.requestApproval(id, o.reasons) } }
+                                        when (val r = withContext(Dispatchers.IO) {
+                                            graph.payments.waitForDecision(id, onOverride = {
+                                                graph.payments.overrideHold(id, method, amt.toDouble(), graph.payments.hashOf(req.payeeVpa), req.isP2P)
+                                            })
+                                        }) {
+                                            HoldResolution.Blocked -> holdStatus = "Your trusted contact blocked this payment. Nothing was paid."
+                                            HoldResolution.ApprovedUpi -> {
+                                                holdStatus = "Payment released."
+                                                onOutcome(PayOutcome.HandOff(id, UpiUriParser.build(req, amt)), req, amt)
+                                            }
+                                            is HoldResolution.ApprovedCheckout -> {
+                                                holdStatus = "Your trusted contact approved this payment."
+                                                r.orderId?.let { oid -> onOutcome(PayOutcome.Checkout(id, oid, amt), req, amt) }
+                                                    ?: run { holdStatus = "Could not start the checkout. Nothing was paid." }
+                                            }
+                                            HoldResolution.Waiting -> holdStatus = "No answer yet. The payment stays on hold; nothing was paid."
+                                            HoldResolution.Unknown -> holdStatus = null
+                                        }
+                                    }
+                                }
+                            }
+                            is PayOutcome.Nudged -> nudge = PendingNudge(o, req, amt)
+                            is PayOutcome.Failed -> error = o.message
+                            else -> onOutcome(o, req, amt)
+                        }
+    }
+
     val paused = pause != PaymentPause.State.Clear
     Column(
         Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        SatarkHeader("Pay via Satark", "Satark checks for signs of a scam before your money moves.")
+        SatarkHeader("Pay via Satark", "Satark checks for signs of a scam before your money moves.", onMarkTap = { com.satark.app.ui.DevMode.tap() })
         if (com.satark.app.BuildConfig.DEBUG && com.satark.app.BuildConfig.LONG_SESSION_TEST_MIN > 0) Text(
             "TEST BUILD: long-session alarm after ${com.satark.app.BuildConfig.LONG_SESSION_TEST_MIN} min (real rule: 2 h)",
             color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelLarge,
         )
         ProtectionSummary(signals)
         ProtectionLink(onOpenProtection)
+        ToolLink("Alert history", "What Satark saw, and what it keeps", Icons.Filled.Info, onOpenHistory)
         PauseCard(pause, graph.pause)
 
         Card(
@@ -189,45 +236,46 @@ fun PayHome(
                         } catch (e: Exception) {
                             PayOutcome.Failed("Something went wrong. No payment was made.")
                         } finally { busy = false }
-                        when (o) {
-                            is PayOutcome.Held -> {
-                                held = ArrayList(o.reasons); graph.pause.start() // saveable type
-                                heldAmountInr = amt.toDouble()
-                                holdStatus = null
-                                o.paymentId?.let { id ->
-                                    // Dual custody: only the person's trusted contact can release this payment.
-                                    holdStatus = "Asking your trusted contact to approve or block this payment…"
-                                    scope.launch {
-                                        withContext(Dispatchers.IO) { runCatching { graph.alerts.requestApproval(id, o.reasons) } }
-                                        when (val r = withContext(Dispatchers.IO) {
-                                            graph.payments.waitForDecision(id, onOverride = {
-                                                graph.payments.overrideHold(id, method, amt.toDouble(), graph.payments.hashOf(req.payeeVpa), req.isP2P)
-                                            })
-                                        }) {
-                                            HoldResolution.Blocked -> holdStatus = "Your trusted contact blocked this payment. Nothing was paid."
-                                            HoldResolution.ApprovedUpi -> {
-                                                holdStatus = "Payment released."
-                                                onOutcome(PayOutcome.HandOff(id, UpiUriParser.build(req, amt)), req, amt)
-                                            }
-                                            is HoldResolution.ApprovedCheckout -> {
-                                                holdStatus = "Your trusted contact approved this payment."
-                                                r.orderId?.let { oid -> onOutcome(PayOutcome.Checkout(id, oid, amt), req, amt) }
-                                                    ?: run { holdStatus = "Could not start the checkout. Nothing was paid." }
-                                            }
-                                            HoldResolution.Waiting -> holdStatus = "No answer yet. The payment stays on hold; nothing was paid."
-                                            HoldResolution.Unknown -> holdStatus = null
-                                        }
-                                    }
-                                }
-                            }
-                            is PayOutcome.Failed -> error = o.message
-                            else -> onOutcome(o, req, amt)
-                        }
+                        handle(o, req, amt)
                     }
                 }) { Text(if (busy) "Checking…" else "Check and pay", style = MaterialTheme.typography.titleSmall) }
             }
         }
 
+        androidx.compose.runtime.LaunchedEffect(Unit) {
+            graph.payments.released.collect { r ->
+                held = null; holdStatus = null; error = null
+                onOutcome(r.outcome, r.req, r.amountInr)
+            }
+        }
+        nudge?.let { p ->
+            AlertDialog(
+                onDismissRequest = { nudge = null },
+                title = { Text("Take a moment") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("You are about to pay someone new while someone you don't know is in touch. Is anyone asking you to do this?")
+                        Reasons(p.n.reasons)
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        nudge = null; busy = true
+                        scope.launch {
+                            val next = try {
+                                withContext(Dispatchers.IO) { p.n.proceed() }
+                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                PayOutcome.Failed("Something went wrong. No payment was made.")
+                            } finally { busy = false }
+                            handle(next, p.req, p.amt)
+                        }
+                    }) { Text("I'm sure, continue") }
+                },
+                dismissButton = { TextButton(onClick = { nudge = null }) { Text("Go back") } },
+            )
+        }
         error?.let { Notice(it, MaterialTheme.colorScheme.errorContainer, MaterialTheme.colorScheme.onErrorContainer) }
         held?.let { reasons ->
             val on = MaterialTheme.colorScheme.onErrorContainer
@@ -247,7 +295,7 @@ fun PayHome(
             "Satark can hold payments started here. Payments started directly in other UPI apps can only be warned about.",
             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        if (com.satark.app.BuildConfig.DEBUG) AttestationExportButton(graph)
+        if (com.satark.app.ui.DevMode.open) AttestationExportButton(graph)
     }
 }
 
@@ -273,6 +321,26 @@ private fun ProtectionLink(onOpen: () -> Unit) {
                 Text("Protection and trusted contact", style = MaterialTheme.typography.titleSmall)
                 Text("Permissions, and who is told if you may be at risk", style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+@Composable
+private fun ToolLink(title: String, subtitle: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onOpen: () -> Unit) {
+    Card(
+        onClick = onOpen, modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLowest),
+    ) {
+        Row(
+            Modifier.padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+            Column(Modifier.weight(1f)) {
+                Text(title, style = MaterialTheme.typography.titleSmall)
+                Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
         }
@@ -398,5 +466,11 @@ private fun AttestationExportButton(graph: AppGraph) {
             }
         }) { Text(if (busy) "Capturing…" else "Export attestation chain for M4") }
         msg?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+        // Starts a demo again from a clean state: the usual payment, known payees, the repeat-alert memory and the history.
+        var confirmReset by remember { mutableStateOf(false) }
+        OutlinedButton(onClick = {
+            if (!confirmReset) confirmReset = true
+            else scope.launch { graph.resetDemoState(); android.os.Process.killProcess(android.os.Process.myPid()) }
+        }) { Text(if (confirmReset) "Tap again: clear demo data and close Satark" else "Reset demo state") }
     }
 }
