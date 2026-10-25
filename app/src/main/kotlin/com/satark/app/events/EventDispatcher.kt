@@ -21,10 +21,13 @@ import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 
 /** An alarm the UI must show, with the features behind it (for the anonymised /signature). */
-data class Alarm(val decision: Decision, val trace: PaymentTrace?, val unknownCallActive: Boolean)
+data class Alarm(val decision: Decision, val trace: PaymentTrace?, val unknownCallActive: Boolean, val fromPayment: Boolean = false)
 
 /** A payment attempt to a new payee during an unknown call that did not reach an alarm: shown as a nudge. */
 data class Nudge(val reasons: List<String>)
+
+/** What the checks said about one payment: the decision, and a nudge when it is allowed but worth a pause. */
+data class Decided(val decision: Decision, val nudge: Nudge?)
 
 /**
  * signal -> EventMapper -> Deduplicator -> store -> EventSequencer -> Detector.onEvent() -> store Decision.
@@ -33,7 +36,7 @@ data class Nudge(val reasons: List<String>)
 class EventDispatcher(
     private val dao: SatarkDao,
     private val model: ModelConfig,
-    private val ageBand: String?,
+    ageYears: Int?,
     private val scope: CoroutineScope,
     private val now: () -> Long = System::currentTimeMillis,
 ) {
@@ -42,7 +45,22 @@ class EventDispatcher(
     private val sequencer = EventSequencer()
     private val baseline = Baseline.coldStart(model)
     private var lastTrace: PaymentTrace? = null
-    private val detector = Detector.create(ageBand, baseline, model).also { it.traceSink = { t -> lastTrace = t } }
+    private var detector = newDetector(ageYears)
+    private var splitGuard = SplitGuard(model, AgeProfile.bandOf(ageYears), baseline)
+    private var highValue = HighValueNewPayee(AgeProfile.highValueThreshold(ageYears))
+
+    private fun newDetector(ageYears: Int?) =
+        Detector.create(AgeProfile.bandOf(ageYears), baseline, model).also { it.traceSink = { t -> lastTrace = t } }
+
+    /**
+     * The person typed (or cleared) their age: use the matching cohort threshold and new-payee hold amount from now on. The three
+     * checks start a fresh session, as they do after a long quiet gap, so an age changed in the middle of a call is not remembered.
+     */
+    suspend fun setAge(ageYears: Int?) = lock.withLock {
+        detector = newDetector(ageYears)
+        splitGuard = SplitGuard(model, AgeProfile.bandOf(ageYears), baseline)
+        highValue = HighValueNewPayee(AgeProfile.highValueThreshold(ageYears))
+    }
 
     private val policy = SessionPolicy()
     private val unknownCallActive get() = policy.unknownCallActive
@@ -74,11 +92,14 @@ class EventDispatcher(
 
     fun submit(s: RawSignal, source: String? = null) {
         scope.launch {
-            val e = EventMapper.map(s)
+            val events = EventMapper.mapAll(s)
             lock.withLock {
-                if (dedup.isDuplicate(e)) return@withLock
-                dao.insertEvent(EventRow(tMs = e.tMs, json = JSONObject(EventMapper.toSchemaMap(e, source)).toString()))
-                sequencer.add(e)
+                if (s is RawSignal.UnknownMessage && policy.callIsOpen) return@withLock // a call is already in progress: leave it alone
+                for (e in events) {
+                    if (dedup.isDuplicate(e)) continue
+                    dao.insertEvent(EventRow(tMs = e.tMs, json = JSONObject(EventMapper.toSchemaMap(e, source)).toString()))
+                    sequencer.add(e)
+                }
             }
             pump(flushAll = false)
             // The sequencer holds new events briefly for reordering; release this one as soon as the hold ends,
@@ -89,20 +110,25 @@ class EventDispatcher(
     }
 
     /** Submit already-mapped events and return the worst Decision they produced (used right before a risk check). */
-    suspend fun submitAndDecide(signals: List<RawSignal>, source: String): Decision {
+    suspend fun submitAndDecide(signals: List<RawSignal>, source: String): Decision = submitAndDecideFull(signals, source).decision
+
+    /** Like [submitAndDecide], plus the nudge to show before the payment goes on (returned, not broadcast, so the person sees it first). */
+    suspend fun submitAndDecideFull(signals: List<RawSignal>, source: String): Decided {
         lock.withLock {
-            for (s in signals) {
-                val e = EventMapper.map(s)
+            for (e in signals.flatMap(EventMapper::mapAll)) {
                 if (dedup.isDuplicate(e)) continue
                 dao.insertEvent(EventRow(tMs = e.tMs, json = JSONObject(EventMapper.toSchemaMap(e, source)).toString()))
                 sequencer.add(e)
             }
         }
-        return pump(flushAll = true)
+        return pumpFull(flushAll = true)
     }
 
-    private suspend fun pump(flushAll: Boolean): Decision = lock.withLock {
-        if (!ready) return@withLock Decision.none()
+    private suspend fun pump(flushAll: Boolean): Decision = pumpFull(flushAll).decision
+
+    private suspend fun pumpFull(flushAll: Boolean): Decided = lock.withLock {
+        if (!ready) return@withLock Decided(Decision.none(), null)
+        var nudged: Nudge? = null
         val batch = if (flushAll) sequencer.flush() else sequencer.drain(now())
         var worst = Decision.none()
         for (e in batch) {
@@ -111,10 +137,12 @@ class EventDispatcher(
                 dao.insertDecision(DecisionRow(tMs = e.tMs, level = d.level.name, score = d.score, reasons = d.reasons.joinToString(","), mechanism = d.mechanism))
             }
             if (d.level.showsScreen) {
-                _alarms.tryEmit(Alarm(d, lastTrace, unknownCallActive))
+                _alarms.tryEmit(Alarm(d, lastTrace, unknownCallActive, fromPayment = e.type == EventType.PAYMENT_ATTEMPT))
                 if (worst.level == Level.NONE) worst = d
-            } else if (e.type == EventType.PAYMENT_ATTEMPT && unknownCallActive && e.payeeIsNew == true) {
-                _nudges.tryEmit(Nudge(emptyList()))
+            } else if (e.type == EventType.PAYMENT_ATTEMPT && NudgePolicy.shouldNudge(policy.unknownContactRecent(e.tMs), e.payeeIsNew, e.amountInr, baseline.median)) {
+                // A payment started in Satark waits for the person (returned to the caller); anything else is shown as a banner.
+                val n = Nudge(NudgePolicy.reasons(policy.unknownCallActive))
+                if (flushAll) nudged = n else _nudges.tryEmit(n)
                 worst = d
             } else if (e.type == EventType.PAYMENT_ATTEMPT && worst.level == Level.NONE) worst = d
         }
@@ -123,15 +151,22 @@ class EventDispatcher(
                 _alarms.tryEmit(Alarm(it, null, unknownCallActive)); worst = it
             }
         else detector.onTick(now()).takeIf { it.level.showsScreen }?.let { _alarms.tryEmit(Alarm(it, null, unknownCallActive)) }
-        worst
+        Decided(worst, nudged)
     }
 
     /** One event into the detector, with the app's session policy. Null when the event is ignored. Call under [lock]. */
     private fun feed(raw: Event): Decision? {
         val step = policy.prepare(raw) ?: return null
-        if (step.resetFirst) detector.reset()
+        if (step.resetFirst) { detector.reset(); splitGuard.reset(); highValue.reset() }
         lastTrace = null
-        return detector.onEvent(step.event)
+        val main = detector.onEvent(step.event)
+        // A second look for payments split into pieces. It only ever adds an alarm; the main decision is never lowered.
+        val extra = splitGuard.onEvent(step.event)
+        if (!main.level.showsScreen && extra.level.showsScreen) { lastTrace = splitGuard.lastTrace; return extra }
+        // A third look for the payments that matter most: new payee, a large amount, and an unknown call that is open or just ended.
+        val big = highValue.onEvent(step.event, policy.unknownCallActive, policy.unknownContactRecent(step.event.tMs))
+        if (!main.level.showsScreen && big.level.showsScreen) { lastTrace = null; return big }
+        return main
     }
 
     /**
