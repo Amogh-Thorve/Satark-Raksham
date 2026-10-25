@@ -6,7 +6,9 @@ import retrofit2.http.Body
 import retrofit2.http.DELETE
 import retrofit2.http.GET
 import retrofit2.http.Header
+import retrofit2.http.PATCH
 import retrofit2.http.POST
+import retrofit2.http.PUT
 import retrofit2.http.Path
 
 // Hand-written mirror of contracts/api.yaml (the plan calls for generation; the schemas are small and the contract
@@ -33,7 +35,12 @@ import retrofit2.http.Path
     @SerialName("fcm_token") val fcmToken: String,
 )
 @Serializable data class TrustedContactResponse(val linked: Boolean, val status: String? = null) // pending | accepted | revoked
-@Serializable data class TrustedRequest(@SerialName("owner_device_id") val ownerDeviceId: String)
+@Serializable data class TrustedRequest(@SerialName("owner_device_id") val ownerDeviceId: String, @SerialName("owner_name") val ownerName: String? = null)
+@Serializable data class TrustedByPhoneRequest(val phone: String)
+@Serializable data class TrustedByPhoneResponse(val requested: Boolean)
+@Serializable data class MyContact(@SerialName("trusted_device_id") val trustedDeviceId: String, val name: String? = null)
+@Serializable data class TrustedContactsResponse(val contacts: List<MyContact>)
+@Serializable data class PushTokenRequest(@SerialName("fcm_token") val fcmToken: String)
 @Serializable data class TrustedRequestsResponse(val requests: List<TrustedRequest>)
 @Serializable data class TrustedRespondRequest(@SerialName("owner_device_id") val ownerDeviceId: String, val decision: String) // accept | decline
 @Serializable data class DecisionDto(val level: String, val score: Double, val reasons: List<String>)
@@ -76,6 +83,9 @@ import retrofit2.http.Path
     @SerialName("payment_id") val paymentId: String? = null,
 )
 @Serializable data class Accepted(val accepted: Boolean)
+@Serializable data class AccountRequest(@SerialName("id_token") val idToken: String, val name: String? = null)
+@Serializable data class AccountNameRequest(val name: String)
+@Serializable data class AccountResponse(val name: String? = null, val created: Boolean = false)
 @Serializable data class SignatureRequest(@SerialName("pattern_id") val patternId: String, val features: Map<String, Double>)
 @Serializable data class ApiError(val code: String, val message: String)
 /** M4's dev-token stub body (hidden from api.yaml; contracts/auth.md "Dev token stub"). */
@@ -90,6 +100,9 @@ interface SatarkApi {
     @POST("auth/refresh") suspend fun refresh(@Body b: RefreshRequest): TokenResponse
     @POST("auth/dev-token") suspend fun devToken(@Body b: DevTokenRequest): TokenResponse
     @POST("trusted-contact") suspend fun trustedContact(@Body b: TrustedContactRequest): TrustedContactResponse
+    @GET("trusted-contact") suspend fun myTrustedContacts(): TrustedContactsResponse
+    @POST("trusted-contact/by-phone") suspend fun trustedContactByPhone(@Body b: TrustedByPhoneRequest): TrustedByPhoneResponse
+    @PUT("device/push-token") suspend fun putPushToken(@Body b: PushTokenRequest): retrofit2.Response<Unit>
     @retrofit2.http.GET("trusted-contact/requests") suspend fun trustedRequests(): TrustedRequestsResponse
     @POST("trusted-contact/respond") suspend fun trustedRespond(@Body b: TrustedRespondRequest): TrustedContactResponse
     @DELETE("trusted-contact/{id}") suspend fun removeTrustedContact(@Path("id") id: String): TrustedContactResponse
@@ -98,6 +111,9 @@ interface SatarkApi {
     @POST("payments/{id}/result") suspend fun paymentResult(@Path("id") id: String, @Body b: PaymentResultRequest): PaymentResponse
     @POST("payments/{id}/decision") suspend fun paymentDecision(@Path("id") id: String, @Body b: PaymentDecisionRequest): PaymentResponse
     @DELETE("device") suspend fun deleteDevice(): retrofit2.Response<Unit>
+    @POST("account") suspend fun account(@Body b: AccountRequest): AccountResponse
+    @PATCH("account") suspend fun renameAccount(@Body b: AccountNameRequest): AccountResponse
+    @DELETE("account") suspend fun signOut(): retrofit2.Response<Unit>
     @POST("alert") suspend fun alert(@Body b: AlertRequest, @Header(RETRY_HEADER) retry: String = "1"): Accepted
     @POST("signature") suspend fun signature(@Body b: SignatureRequest, @Header(RETRY_HEADER) retry: String = "1"): Accepted
 }
