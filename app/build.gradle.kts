@@ -101,7 +101,7 @@ dependencies {
     implementation("com.google.mlkit:barcode-scanning:17.3.0")
     implementation("com.razorpay:checkout:1.6.40")
     // 33.x on purpose: newer BoMs pull a Kotlin stdlib newer than this project's Kotlin 2.0.21 compiler can read.
-    implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
+    implementation(platform("com.google.firebase:firebase-bom:35.1.0"))
     implementation("com.google.firebase:firebase-messaging")
     implementation("com.google.firebase:firebase-auth") // phone number sign-in (account/PhoneAuth.kt)
 
