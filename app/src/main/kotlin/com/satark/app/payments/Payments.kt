@@ -25,6 +25,11 @@ sealed interface PayOutcome {
     data class HandOff(val paymentId: String, val upiUri: String) : PayOutcome
     data class Checkout(val paymentId: String, val orderId: String, val amountInr: BigDecimal) : PayOutcome
     data class Failed(val message: String) : PayOutcome
+    /**
+     * Allowed, but worth a pause: the person reads [reasons] and chooses. Nothing has gone to the server or the UPI app yet; [proceed]
+     * does the server check and the hand-off (its result is never another Nudged), and "Go back" simply does not call it.
+     */
+    data class Nudged(val reasons: List<String>, val proceed: suspend () -> PayOutcome) : PayOutcome
 }
 
 /** Where a held payment stands once the owner's trusted contact may have answered (server state, GET /payments/{id}). */
@@ -99,7 +104,20 @@ class PaymentRepository(
      * Pay via Satark. Events reach the detector BEFORE any money moves; then /risk-check; HOLD stops everything.
      * If the server cannot be reached nothing is launched, and an alarmed payment is reported as held.
      */
-    suspend fun start(req: UpiRequest, amountInr: BigDecimal, source: String, method: String): PayOutcome {
+    suspend fun start(req: UpiRequest, amountInr: BigDecimal, source: String, method: String): PayOutcome =
+        rememberHold(req, amountInr, method, checkAndStart(req, amountInr, source, method))
+
+    /** A held payment is remembered so that "Continue anyway" knows what to go on with; a nudged one is remembered once it is held. */
+    private fun rememberHold(req: UpiRequest, amountInr: BigDecimal, method: String, o: PayOutcome): PayOutcome {
+        if (o is PayOutcome.Nudged) {
+            pendingHold = null
+            return PayOutcome.Nudged(o.reasons) { rememberHold(req, amountInr, method, o.proceed()) }
+        }
+        pendingHold = (o as? PayOutcome.Held)?.let { h -> HeldPayment(req, amountInr, method, h.paymentId) }
+        return o
+    }
+
+    private suspend fun checkAndStart(req: UpiRequest, amountInr: BigDecimal, source: String, method: String): PayOutcome {
         if (amountInr.signum() <= 0 || amountInr > MAX_AMOUNT_INR) return PayOutcome.Failed("Enter an amount between ₹0.01 and ₹1,00,00,000.")
         val hash = hasher.hash(req.payeeVpa)
         val isNew = dao.payeeCount(hash) == 0
@@ -108,8 +126,18 @@ class PaymentRepository(
             if (isNew) add(RawSignal.PayeeAdded(t, hash))
             add(RawSignal.PaymentAttempt(t, hash, amountInr.toDouble(), req.isP2P, isNew, source))
         }
-        val decision: Decision = dispatcher.submitAndDecide(signals, source)
+        val decided = dispatcher.submitAndDecideFull(signals, source)
+        val decision: Decision = decided.decision
         val alarmed = decision.level.showsScreen && !shadow()
+        val nudge = decided.nudge?.takeIf { !alarmed && !shadow() }
+        // Allowed, but worth a pause: the person reads why and chooses BEFORE the server check and the UPI hand-off, so the warning
+        // is never hidden behind the UPI app that opens next.
+        if (nudge != null) return PayOutcome.Nudged(nudge.reasons) { riskCheckAndStart(req, amountInr, method, hash, decision, alarmed) }
+        return riskCheckAndStart(req, amountInr, method, hash, decision, alarmed)
+    }
+
+    /** The server's check, then the hand-off or the hold. */
+    private suspend fun riskCheckAndStart(req: UpiRequest, amountInr: BigDecimal, method: String, hash: String, decision: Decision, alarmed: Boolean): PayOutcome {
         val dto = DecisionDto(if (decision.level.showsScreen && shadow()) "LOG" else decision.level.name, decision.score, decision.reasons.take(3))
         kotlinx.coroutines.withTimeoutOrNull(RiskTimeout.SIGN_IN_MS) { ready() }
         val check = try {
@@ -156,7 +184,53 @@ class PaymentRepository(
     private val activeHold = java.util.concurrent.atomic.AtomicReference<String?>(null)
     private val overrideRequested = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    /** "Continue anyway" on the Hard screen. Only counts while a payment is being held and waited on. */
+    /** The payment the last check held, so that "Continue anyway" knows what the person wants to go on with. */
+    data class HeldPayment(val req: UpiRequest, val amountInr: BigDecimal, val method: String, val paymentId: String?)
+
+    /** A held payment the person chose to go on with: the screen starts the UPI app (or checkout) from this. */
+    data class Released(val outcome: PayOutcome, val req: UpiRequest, val amountInr: BigDecimal)
+
+    @Volatile var pendingHold: HeldPayment? = null
+    val released = kotlinx.coroutines.flow.MutableSharedFlow<Released>(extraBufferCapacity = 1)
+
+    /**
+     * "Continue anyway" on the Stop screen: the person's own choice to go on with the payment that was held.
+     *  - While the app is waiting on the server for that payment, hand the choice to that wait, which releases it once.
+     *  - Otherwise ask the server to release it. If the server refuses, nothing is released.
+     *  - If the server cannot be reached (or there never was a server payment), release it on this phone. Only a UPI
+     *    hand-off can be released this way; a checkout needs the server's order.
+     * Nothing is sent to the UPI app unless the person pressed the button.
+     */
+    suspend fun continueAnyway() {
+        if (activeHold.get() != null) { overrideRequested.set(true); return }
+        val h = pendingHold ?: return
+        val outcome: PayOutcome? = if (h.paymentId != null) {
+            try {
+                val r = api().riskCheck(RiskCheckRequest(DecisionDto("NONE", 0.0, emptyList()), h.method, h.amountInr.toDouble(), hasher.hash(h.req.payeeVpa), h.req.isP2P, true, h.paymentId))
+                when {
+                    r.decision != "ALLOW" -> null
+                    h.method == "checkout" -> r.orderId?.let { PayOutcome.Checkout(h.paymentId, it, h.amountInr) }
+                    else -> PayOutcome.HandOff(h.paymentId, UpiUriParser.build(h.req, h.amountInr))
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: retrofit2.HttpException) {
+                null // the server said no
+            } catch (e: Exception) {
+                localRelease(h)
+            }
+        } else localRelease(h)
+        if (outcome != null) {
+            pendingHold = null
+            released.emit(Released(outcome, h.req, h.amountInr))
+        }
+    }
+
+    private fun localRelease(h: HeldPayment): PayOutcome? =
+        if (h.method == "checkout") null
+        else PayOutcome.HandOff(RiskTimeout.LOCAL_PREFIX + java.util.UUID.randomUUID(), UpiUriParser.build(h.req, h.amountInr))
+
+    /** Kept for callers that only want the flag. */
     fun requestOverride() { if (activeHold.get() != null) overrideRequested.set(true) }
 
     /** Release the caller's own held payment (POST /risk-check override). Null when the server refuses or is unreachable. */
