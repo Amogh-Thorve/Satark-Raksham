@@ -1,5 +1,6 @@
 package com.satark.app
 
+import kotlinx.serialization.encodeToString
 import android.app.Application
 import com.satark.app.events.EventDispatcher
 import com.satark.app.events.TextBurst
@@ -62,6 +63,37 @@ class AppGraph(private val app: Application) {
     }
     val hub = SignalHub(app)
     val textBurst = TextBurst(textStore(app))
+    private val deviceNotifier by lazy { com.satark.app.ui.alerts.DeviceCheckNotifier(app) }
+    private val guardNotifier by lazy { com.satark.app.guard.DownloadGuardNotifier(app) }
+    private val guardJson = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+    /** Watches Downloads and chat documents; moves a scam-named app into quarantine and warns. Opt-in, and reads only file names. */
+    val downloadGuard = com.satark.app.guard.DownloadGuard(
+        watchedDirs = { com.satark.app.guard.watchedDownloadDirs() },
+        quarantineDir = java.io.File(app.filesDir, "quarantine"),
+        store = object : com.satark.app.guard.GuardStore {
+            override var records: List<com.satark.app.guard.GuardRecord>
+                get() = runCatching { guardJson.decodeFromString<List<com.satark.app.guard.GuardRecord>>(store.guardRecordsJson) }.getOrDefault(emptyList())
+                set(v) { store.guardRecordsJson = guardJson.encodeToString(v) }
+            override var allowed: Set<String>
+                get() = runCatching { guardJson.decodeFromString<List<String>>(store.guardAllowedJson).toSet() }.getOrDefault(emptySet())
+                set(v) { store.guardAllowedJson = guardJson.encodeToString(v.toList()) }
+        },
+        enabled = { store.downloadGuardOn && com.satark.app.guard.hasAllFilesAccess() && !store.shadowMode },
+        onEvent = { guardNotifier.show(it) },
+    )
+    /** Looks at the apps on the phone as the person goes to pay, and warns if it is a weaker place to pay from. A warning only. */
+    val deviceCheck = com.satark.app.security.DeviceCheck(
+        scanner = com.satark.app.security.AndroidPhoneScanner(app),
+        policy = com.satark.app.security.DevicePolicy(object : com.satark.app.security.DeviceCheckStore {
+            override var ackFingerprint: String? by store::deviceAckFp
+            override var ackAtMs: Long by store::deviceAckMs
+            override var notifiedFingerprint: String? by store::deviceNotifiedFp
+            override var notifiedAtMs: Long by store::deviceNotifiedMs
+        }),
+        selfPackage = app.packageName,
+        notify = { deviceNotifier.show(it) },
+        shadow = { store.shadowMode },
+    )
     /** One instance for the whole sign-in, so a screen rotation does not lose the code Firebase is waiting for. */
     val phoneAuth: com.satark.app.account.PhoneAuth by lazy {
         when {
@@ -81,9 +113,8 @@ class AppGraph(private val app: Application) {
     })
     private val alarmNotifier by lazy { com.satark.app.ui.alerts.AlarmNotifier(app) }
 
-    /** Tell the trusted contact (queued if offline). Nothing to do when this phone has no linked contact. */
+    /** Tell the trusted contact (queued if offline). The server knows who the contact is and does nothing when there is none. */
     private suspend fun tellContact(type: String) {
-        if (store.linkedContactId == null) return
         val id = store.deviceId ?: return
         queue.alert(com.satark.app.net.AlertRequest(id, type))
     }
@@ -141,9 +172,8 @@ class AppGraph(private val app: Application) {
      */
     suspend fun deleteAllData() {
         // Deleting everything also ends protection, so the contact hears it first. Sent directly, not queued: the queue is emptied below.
-        val contact = store.linkedContactId
         val me = store.deviceId
-        if (contact != null && me != null) kotlinx.coroutines.withContext(Dispatchers.IO) {
+        if (me != null) kotlinx.coroutines.withContext(Dispatchers.IO) {
             kotlinx.coroutines.withTimeoutOrNull(5_000) {
                 runCatching { api.alert(com.satark.app.net.AlertRequest(me, com.satark.app.protection.ProtectionOff.TYPE_OFF)) }
             }
@@ -197,13 +227,14 @@ class AppGraph(private val app: Application) {
     private val upiApps = com.satark.app.ui.alerts.AlertController.UPI_APPS + if (BuildConfig.DEBUG) setOf("t.fakeupi") else emptySet()
     fun startCapture() {
         capturing = true
+        scope.launch(Dispatchers.IO) { runCatching { downloadGuard.refresh(); downloadGuard.sweep() } }
         hub.start { s ->
             evidence.record(s)
             dispatcher.submit(s)
             if (s is com.satark.app.signals.RawSignal.AppForeground && s.appPackage in upiApps) alerts.paymentAppOpened()
         }
     }
-    fun stopCapture() { capturing = false; hub.stop() }
+    fun stopCapture() { capturing = false; hub.stop(); downloadGuard.stop() }
 }
 
 /** When stranger texts arrived, kept in plain private prefs (times only: no number, no text). */
