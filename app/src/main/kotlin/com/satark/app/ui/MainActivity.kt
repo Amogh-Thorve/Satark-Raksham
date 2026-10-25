@@ -2,7 +2,6 @@ package com.satark.app.ui
 
 import android.content.Intent
 import android.os.Bundle
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -17,6 +16,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.lifecycleScope
 import com.razorpay.Checkout
 import com.razorpay.PaymentResultListener
@@ -29,6 +29,8 @@ import com.satark.app.payments.UpiResultParser
 import com.satark.app.signals.SignalService
 import com.satark.app.ui.alerts.AlertHost
 import com.satark.app.ui.alerts.ContactDecisionScreen
+import com.satark.app.ui.alerts.HistoryScreen
+import com.satark.app.ui.login.LoginFlow
 import com.satark.app.ui.onboarding.ConsentScreen
 import com.satark.app.ui.onboarding.OnboardingFlow
 import com.satark.app.ui.pay.PayHome
@@ -41,7 +43,7 @@ import java.math.BigDecimal
 /** What is in flight between "ALLOW" and the final payment state. */
 class PendingPay(val paymentId: String, val request: UpiRequest, val amountInr: BigDecimal)
 
-class MainActivity : ComponentActivity(), PaymentResultListener {
+class MainActivity : FragmentActivity(), PaymentResultListener { // FragmentActivity: the fingerprint prompt needs one
     private val graph get() = (application as SatarkApp).graph
     private var pending: PendingPay? = null
     private var status by mutableStateOf<String?>(null)
@@ -49,6 +51,9 @@ class MainActivity : ComponentActivity(), PaymentResultListener {
     private var showProtection by mutableStateOf(false)
     private var consentAsked by mutableStateOf(false)
     private var decidePaymentId by mutableStateOf<String?>(null) // trusted contact opened a held-payment alert
+    private var showHistory by mutableStateOf(false)
+    private var showLogin by mutableStateOf(false) // sign in from the Protection screen
+    private var signInDone by mutableStateOf(false) // first run: signed in, or chose to continue without an account
 
     private val upiLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         val p = pending ?: return@registerForActivityResult
@@ -68,10 +73,13 @@ class MainActivity : ComponentActivity(), PaymentResultListener {
 
     override fun onStart() {
         super.onStart()
+        graph.appVisible = true
+        lifecycleScope.launch(Dispatchers.IO) { runCatching { graph.protectionOff.completeIfDue() } } // a finished wait takes effect now
         graph.hub.screenRecording.register(getSystemService(android.view.WindowManager::class.java), mainExecutor)
     }
 
     override fun onStop() {
+        graph.appVisible = false
         graph.hub.screenRecording.unregister(getSystemService(android.view.WindowManager::class.java))
         super.onStop()
     }
@@ -79,9 +87,13 @@ class MainActivity : ComponentActivity(), PaymentResultListener {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge() // Android 15 draws behind the system bars anyway; Root() keeps content clear of them
         super.onCreate(savedInstanceState)
-        lifecycleScope.launch(Dispatchers.IO) { runCatching { graph.session.ensureRegistered() } }
+        lifecycleScope.launch(Dispatchers.IO) {
+            runCatching { graph.session.ensureRegistered() }
+            graph.accounts.refreshPush() // keeps a signed-in phone reachable after Google changes its push address
+        }
         if (graph.store.onboarded && graph.store.consent) SignalService.start(this)
         consentAsked = graph.store.consentAsked
+        signInDone = graph.store.signedIn || graph.store.signInSkipped
         handleOpen(intent)
         setContent { SatarkTheme { Root() } }
     }
@@ -116,13 +128,22 @@ class MainActivity : ComponentActivity(), PaymentResultListener {
                 ContactDecisionScreen(graph.payments, deciding) { decidePaymentId = null }
             } else if (!consentAsked) {
                 ConsentScreen { agreed -> graph.store.consent = agreed; consentAsked = true }
+            } else if (!onboarded && !signInDone) {
+                LoginFlow(graph) { signInDone = true }
+            } else if (showLogin) {
+                BackHandler { showLogin = false }
+                LoginFlow(graph) { showLogin = false }
             } else if (!onboarded) {
                 OnboardingFlow(graph) { graph.store.onboarded = true; onOnboarded(); if (graph.store.consent) SignalService.start(this@MainActivity) }
             } else if (showProtection) {
                 BackHandler { showProtection = false }
-                OnboardingFlow(graph, settings = true, onDeleted = { showProtection = false; recreate() }) { showProtection = false }
+                OnboardingFlow(graph, settings = true, onDeleted = { showProtection = false; recreate() }, onSignIn = { showLogin = true }) { showProtection = false }
+            } else if (showHistory) {
+                BackHandler { showHistory = false }
+                HistoryScreen(graph) { showHistory = false }
             } else {
-                PayHome(graph, status, ::onOutcome, onOpenProtection = { showProtection = true }, onNewPayment = { status = null })
+                PayHome(graph, status, ::onOutcome, onOpenProtection = { showProtection = true }, onNewPayment = { status = null },
+                    onOpenHistory = { showHistory = true })
             }
         }
     }
