@@ -15,7 +15,7 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
+import com.satark.app.ui.theme.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -33,21 +33,26 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import com.satark.app.ui.lock.rememberLockGate
 
 /** Picks the screen from the AlertUi. Nudge is a dismissible banner; the rest take over the screen. */
 @Composable
 fun AlertHost(alert: AlertUi?, controller: AlertController, dialContactUri: String? = null) {
     val ctx = androidx.compose.ui.platform.LocalContext.current
+    val lock = rememberLockGate()
     when (alert) {
         null -> Unit
         is AlertUi.Nudge -> NudgeBanner(alert, controller::dismiss)
+        is AlertUi.TextBurst -> TextBurstBanner(controller::dismiss)
         is AlertUi.Hard -> HardIntervention(
             alert,
             onCallContact = {
                 runCatching { ctx.startActivity(ContactDialer.intent(ctx, dialContactUri)) } // no dialler: still tell the contact
                 controller.escalateToTrustedContact()
             },
-            onHold30 = controller::holdThirtyMinutes, onContinue = controller::continueAnyway,
+            onHold30 = controller::holdThirtyMinutes,
+            // Going on past a Stop screen needs the owner's fingerprint (or screen-lock PIN on a phone with none): someone driving the screen remotely cannot give it.
+            onContinue = { lock.require("Continue with this payment?") { controller.continueAnyway() } },
         )
         is AlertUi.LongSession -> LongSessionAlert(alert, controller::dismiss)
         is AlertUi.TrustedContact -> TrustedContactAlert(alert, controller::dismiss)
@@ -140,7 +145,30 @@ fun NudgeBanner(a: AlertUi.Nudge, onDismiss: () -> Unit) {
     }
 }
 
-/** Forced pause. The held payment cannot be continued from here: the only ways out are cancel or tell someone. */
+/** Several texts from strangers in a short time: a warning, with what to do. Dismissible. */
+@Composable
+fun TextBurstBanner(onDismiss: () -> Unit) {
+    val on = MaterialTheme.colorScheme.onTertiaryContainer
+    Card(
+        Modifier.safeDrawingPadding().fillMaxWidth().padding(12.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer),
+        elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Icon(Icons.Filled.Warning, contentDescription = null, tint = on)
+                Text("Many texts from strangers", style = MaterialTheme.typography.titleMedium, color = on)
+            }
+            Text("Several numbers you don't know have texted you in a few minutes. Scammers do this to build pressure before they call or ask for money.", color = on)
+            Text("\u2022 Don't open links or install apps from these texts.", color = on)
+            Text("\u2022 Never share your OTP or UPI PIN.", color = on)
+            Text("\u2022 If they ask you to pay, stop and call someone you trust.", color = on)
+            OutlinedButton(onClick = onDismiss) { Text("Got it") }
+        }
+    }
+}
+
+/** Forced pause. The ways out are to tell someone, to hold the payment, or "Continue anyway", which needs the owner's fingerprint (or screen-lock PIN on a phone with none). */
 @Composable
 fun HardIntervention(a: AlertUi.Hard, onCallContact: () -> Unit, onHold30: () -> Unit, onContinue: () -> Unit) {
     val on = MaterialTheme.colorScheme.onErrorContainer
@@ -154,14 +182,12 @@ fun HardIntervention(a: AlertUi.Hard, onCallContact: () -> Unit, onHold30: () ->
         ReadAloudButton("Stop. This looks like a scam.", "Hang up. A real bank or police officer will never ask you to move money or install an app.", a.reasons, on)
         PlaybookCard(a.reasons)
         PurposeQuestion()
-        Text("Payments in Satark are paused for ${Friction.PAUSE_MS / 60_000} minutes so you can talk to someone you trust.",
-            style = MaterialTheme.typography.bodyMedium, color = on)
         Button(
             onClick = onCallContact, modifier = Modifier.fillMaxWidth(),
             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error, contentColor = MaterialTheme.colorScheme.onError),
         ) { Text("Call trusted contact") }
         OutlinedButton(onClick = onHold30, modifier = Modifier.fillMaxWidth()) { Text("Hold payment 30 minutes", color = on) }
-        TextButton(onClick = onContinue, modifier = Modifier.fillMaxWidth()) { Text("Continue anyway", color = on) }
+        TextButton(onClick = onContinue, modifier = Modifier.fillMaxWidth()) { Text("Continue anyway (confirm it is you)", color = on) }
     }
 }
 
