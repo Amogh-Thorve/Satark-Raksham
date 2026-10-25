@@ -162,6 +162,32 @@ tests pass; debug, release and androidTest builds succeed; no new stubs.
 Note for the Razorpay run: webhooks only arrive if the dashboard account is the account the API keys belong to (checked with
 `GET https://api.razorpay.com/v1/webhooks`, which lists the webhooks of the key's account).
 
+### Phase 4: restart after reboot, tighter nudge, split-payment guard, alert budget (unit level only)
+
+These are JVM unit tests. They pass on JDK 21 (`./gradlew :app:testDebugUnitTest` and `:app:assembleDebug`), but they have
+**not** been run on the emulator or a phone yet.
+
+| # | Area | Test | Expected |
+|---|---|---|---|
+| 38 | Restart | `RestartPolicyTest` (3 tests) | Boot and app update restart protection; other broadcasts do not |
+| 39 | Nudge | `PaymentPolicyTest` (9 tests) | Nudge only for a new payee during an unknown call with amount >= 2x the usual payment; bad input never nudges |
+| 40 | Split guard | `SplitGuardVectorsTest` (2 tests), `ops/eval/split_guard.py` | Three part-payments to one new payee within an hour are judged on their total |
+| 41 | Alert budget | History screen card | Shows the simulated alert budget and the nudges shown in the last 30 days; figures come from `ops/eval/reports/alert_budget.md` |
+| 42 | Stranger-text burst | `TextBurstTest` (4 tests) | 3 texts from numbers not in contacts within 10 minutes show a "Many texts from strangers" warning (notification when Satark is not open); the count restarts after a warning and survives an app restart. The nudge has no cooldown and a warning no longer starts a 15-minute pause ("Hold payment 30 minutes" is still offered) |
+| 43 | Why this alert | Nudge banner reasons (`NudgePolicy.REASONS`) | The nudge now lists three plain-language reasons (English and Hindi strings already exist), like an alarm |
+| 44 | Scenarios | `ScenarioTest` (3 tests) | Cloned-voice family emergency is warned; a split payment is no quieter than the whole one; an ordinary call with a known payee stays quiet |
+| 52 | Nudge as a step, Stop screen on every held payment | `NudgeReasonsTest` (3), `DispatcherNudgeTest` (4, the real dispatcher with an in-memory store: unknown call + Rs 5,000 new payee gives a nudge and no stop; Rs 30,000 gives a stop; Rs 200 and no-call give neither); iQOO log showed the UPI chooser opening over the old banner and repeat Stops folded away | Fixed; to re-run on the iQOO once it is back on USB | Unit tests pass, device pending |
+| 51 | Turning off and removal | `ProtectionOffTest` (9), server `test_p4_alerts` (new types, 41 server tests in the alert and contract files); emulator with a local dev server, a second registered device as contact (accepted), PIN-only lock, demo build with a 1-minute wait: guard on, `pm uninstall` fails with `DELETE_FAILED_DEVICE_POLICY_MANAGER`, shell `remove-active-admin` refused as non-test; switch off, PIN, screen reads "Protection will turn off in 1 min. Your trusted contact has been told.", server row `protection_off_requested` at once; a minute later the switch is off, a "Satark protection is off" notification, server row `protection_off`; Settings, Device admin apps, Satark, Deactivate: Android shows Satark's warning, server row `removal_guard_off`; Delete my data: dialog says the contact is told first, server row `protection_off` before the wipe | The contact is told at each step | Pass |
+| 50 | PIN fallback | `LockStateTest` (5); emulator after clearing the screen lock (which removed the fingerprint) and setting PIN 1234: Protection shows "On: screen-lock PIN" with "Add a fingerprint"; "Try it": PIN prompt, wrong PIN (prompt stays), right PIN ("It works") | A phone with no fingerprint is asked for its screen-lock PIN | Pass |
+| 49 | Fingerprint lock | `LockStateTest` (3); emulator with an enrolled fingerprint: Protection screen "Fingerprint lock: On" and "Try it" (prompt, matched finger, "It works"); unknown call, Rs 30,000 to a new payee, Stop screen, "Continue anyway (fingerprint)": wrong finger (prompt stays), cancel (Stop screen stays, nothing released), right finger (released to the UPI app, "The UPI app reported success"); "Choose the person to call": prompt, cancel (nothing), matched finger (contact picker flow) | The payment is released only after a matched fingerprint | Pass |
+| 48 | Age under 22 | `AgeProfileTest` (4), `ConditionMatrixTest` (age 21 and 22), emulator: typed 21 in "Your age" on the Protection screen (line changed to "held from Rs 10,000"), unknown call, Rs 10,000 to a new payee | Stop screen: new payee after an unknown contact, large amount, on a call with someone not in your contacts. Age 22 at the same amount is a nudge in the unit test | Pass |
+| 47 | High-value new payee | `HighValueNewPayeeTest` (4), `ConditionMatrixTest` (asserts every row), emulator: unknown call, hang up, Rs 30,000 to a new payee | Stop screen: new payee after an unknown contact, large amount, contact in the last 2 hours; playbook "Someone you don't know is guiding this" | Pass |
+| 45 | Funnel | History screen | Adds "payments held in the last 30 days" beside warnings, folded repeats and nudges |
+| 46 | Re-theme (blue, lavender wash, white rounded cards) | Emulator, cleared app data, fresh install | Consent, setup, pay, settings and history screens render in the new theme; the nudge (amber) with 3 reasons, the full hold screen (rose) with Report fraud, Read aloud, Call trusted contact, Hold 30 minutes and Continue anyway, and a completed UPI payment all still work; history shows held 1 and nudge 1 | Pass |
+
+Still to run on a device: reboot the emulator and check the protection notice returns without opening Satark; the same
+after `adb install -r`; a 3-part split to a new payee during an unknown call (`app/tools/phone_check.py` is the place to add it).
+
 ## Defects found and fixed (all on `role_1`)
 
 | | Defect | Fix | Commit |
